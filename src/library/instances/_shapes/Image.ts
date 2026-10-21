@@ -1,6 +1,7 @@
 import { IShape, Shape, ShapeRawData } from "../Shape";
 import { Render } from "../../Render";
 import { Vector } from "../common/Vector";
+import { svgEscape, svgNum, svgTransform } from "../utils/svg";
 
 export type ImageRawData = ShapeRawData & {
     src: string;
@@ -387,7 +388,7 @@ export class Image extends Shape {
         return {
             id: this.id,
             type: "image",
-            position: this.position,
+            position: { x: this.position.x, y: this.position.y },
             rotation: this.rotation,
             zIndex: this.zIndex,
             dragging: this.dragging,
@@ -403,10 +404,28 @@ export class Image extends Shape {
 
     /**
      * @internal
+     * Returns an SVG `<image>` fragment for this image in world coordinates.
+     * @returns SVG markup for the image.
+     */
+    public override _toSVG(): string {
+        if (!this.visible) return "";
+        const stroke = this.borderWidth > 0
+            ? ` stroke="${svgEscape(this.borderColor)}" stroke-width="${svgNum(this.borderWidth)}"`
+            : "";
+        const rx = this.borderRadius > 0 ? ` rx="${svgNum(this.borderRadius)}"` : "";
+        const image = `<image href="${svgEscape(this.src)}" x="0" y="0" width="${svgNum(this.width)}" height="${svgNum(this.height)}"${rx} preserveAspectRatio="none" />`;
+        const border = this.borderWidth > 0
+            ? `<rect x="0" y="0" width="${svgNum(this.width)}" height="${svgNum(this.height)}"${rx} fill="none"${stroke} />`
+            : "";
+        return `<g transform="${svgTransform(this.position.x, this.position.y, this.rotation)}">${image}${border}</g>`;
+    }
+
+    /**
+     * @internal
      * Creates a new image instance from raw data.
      */
     public static _fromRawData(data: ImageRawData, render: Render): Image {
-        const image = new Image(data, render, data.id);
+        const image = new Image({ ...data, position: new Vector(data.position.x, data.position.y) }, render, data.id);
         image.position = new Vector(data.position.x, data.position.y);
         image.rotation = data.rotation;
         image.zIndex = data.zIndex;

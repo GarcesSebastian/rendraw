@@ -19,11 +19,11 @@ export class Selection {
     /** Array of shapes currently within the selection box. */
     public _selected: Shape[] = [];
     /** Indicates if the user is currently dragging to create a selection box. */
-    public _isSelecting: boolean = false;
+    private _isSelecting: boolean = false;
     /** Flag to prevent clearing selection immediately after it's made. */
     public _justFinishedSelecting: boolean = false;
     /** The starting position of the selection drag. */
-    public _startPosition: Vector = Vector.zero;
+    private _startPosition: Vector = Vector.zero;
     /** The ending position of the selection drag. */
     public _endPosition: Vector = Vector.zero;
     /** The width of the selection box. */
@@ -32,6 +32,64 @@ export class Selection {
     public _height: number = 0;
     /** The minimum distance the mouse must travel to initiate a selection box. */
     public _minDistance: number = 5;
+
+    /**
+     * Whether the user is currently dragging to create a selection box.
+     * @returns `true` while a selection drag is in progress.
+     */
+    public get isSelecting(): boolean {
+        return this._isSelecting;
+    }
+
+    /**
+     * @internal
+     * Begins a selection drag at the given world position.
+     * @param start - The world-space position where the drag started.
+     */
+    public begin(start: Vector): void {
+        this._startPosition = start;
+        this._isSelecting = true;
+        this._justFinishedSelecting = false;
+    }
+
+    /**
+     * @internal
+     * Updates the selection box with the current drag position.
+     * @param current - The current world-space pointer position.
+     */
+    public track(current: Vector): void {
+        this._endPosition = current;
+        this._width = this._endPosition.x - this._startPosition.x;
+        this._height = this._endPosition.y - this._startPosition.y;
+    }
+
+    /**
+     * @internal
+     * Finalizes the selection drag, detecting selected shapes when the box is
+     * larger than the minimum distance threshold.
+     */
+    public finish(): void {
+        if (this._isSelecting) {
+            const distance = Math.sqrt(this._width * this._width + this._height * this._height);
+            if (distance >= this._minDistance) {
+                this.detectSelectedShapes();
+                this._justFinishedSelecting = true;
+            }
+        }
+        this.reset();
+    }
+
+    /**
+     * @internal
+     * Resets the selection box state.
+     */
+    public reset(): void {
+        this._isSelecting = false;
+        this._startPosition = Vector.zero;
+        this._endPosition = Vector.zero;
+        this._width = 0;
+        this._height = 0;
+    }
 
     /**
      * Creates a new Selection instance.

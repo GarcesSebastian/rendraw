@@ -196,7 +196,7 @@ export class Table<TData extends TableSchema = any> implements ITable {
         onProgress?: (progress: { p: number; state: boolean }) => void
     ): Promise<Array<TData[keyof TData & string]>> {
         if (useWorker) {
-            return (this.indexDB as any).bulkInsert(this.name, dataArray, true, onProgress);
+            return this.indexDB.bulkInsert(this.name, dataArray, true, onProgress);
         }
         
         if (dataArray.length > batchSize) {
@@ -323,7 +323,7 @@ export class Table<TData extends TableSchema = any> implements ITable {
         batchSize: number = 50
     ): Promise<Array<TData | null>> {
         if (useWorker && updates.length > 50) {
-            return (this.indexDB as any).bulkUpdate(this.name, updates, true);
+            return this.indexDB.bulkUpdate(this.name, updates, true);
         }
         
         if (updates.length > batchSize) {
@@ -376,7 +376,7 @@ export class Table<TData extends TableSchema = any> implements ITable {
         batchSize: number = 50
     ): Promise<void> {
         if (useWorker && keys.length > 50) {
-            await (this.indexDB as any).bulkDelete(this.name, keys, true);
+            await this.indexDB.bulkDelete(this.name, keys, true);
             return;
         }
         
@@ -474,35 +474,23 @@ export class Table<TData extends TableSchema = any> implements ITable {
 
     /**
      * Finds records matching a predicate function.
+     *
+     * The predicate always runs on the main thread, streaming records through an
+     * IndexedDB cursor. No function source is ever serialized or sent to the
+     * worker, so closures are preserved and the library needs no CSP
+     * `unsafe-eval`.
+     *
      * @param predicate - Function to test each record.
-     * @param useWorker - Whether to use web worker for processing (default: true).
+     * @param _useWorker - Accepted for backwards compatibility and ignored; the
+     *   predicate can only run on the main thread (see method description).
      * @param limit - Optional maximum number of results to return.
      * @returns Promise resolving to array of matching records.
      */
     public async find(
         predicate: (item: TData) => boolean,
-        useWorker: boolean = true,
+        _useWorker: boolean = true,
         limit?: number
     ): Promise<TData[]> {
-        if (useWorker) {
-            try {
-                const filterCode = predicate.toString();
-                const result = await (this.indexDB as any).complexQuery(
-                    this.name,
-                    'FILTER_LARGE_DATASET',
-                    {
-                        filterCode: `return (${filterCode})(record, params);`,
-                        filterParams: {}
-                    },
-                    true
-                );
-                
-                return limit ? result.slice(0, limit) : result;
-            } catch (error) {
-                console.warn('Worker filter failed, using normal method:', error);
-            }
-        }
-        
         return new Promise((resolve, reject) => {
             const store = this._getStore('readonly');
             const request = store.openCursor();
@@ -616,32 +604,21 @@ export class Table<TData extends TableSchema = any> implements ITable {
 
     /**
      * Performs aggregation operations on all records in the table.
+     *
+     * The aggregate function always runs on the main thread over the table's
+     * `getAll()` result. No function source is serialized or sent to the worker,
+     * so closures are preserved and the library needs no CSP `unsafe-eval`.
+     *
      * @template TResult - The type of the aggregation result.
      * @param aggregateFunction - Function that performs the aggregation on all records.
-     * @param useWorker - Whether to use web worker for processing (default: true).
+     * @param _useWorker - Accepted for backwards compatibility and ignored; the
+     *   aggregate function can only run on the main thread (see method description).
      * @returns Promise resolving to the aggregation result.
      */
     public async aggregate<TResult = any>(
         aggregateFunction: (records: TData[]) => TResult,
-        useWorker: boolean = true
+        _useWorker: boolean = true
     ): Promise<TResult> {
-        if (useWorker) {
-            try {
-                const aggregateCode = aggregateFunction.toString();
-                return await (this.indexDB as any).complexQuery(
-                    this.name,
-                    'AGGREGATE',
-                    {
-                        aggregateCode: `return (${aggregateCode})(records, params);`,
-                        aggregateParams: {}
-                    },
-                    true
-                );
-            } catch (error) {
-                console.warn('Worker aggregate failed, using normal method:', error);
-            }
-        }
-        
         const allRecords = await this.getAll();
         return aggregateFunction(allRecords);
     }

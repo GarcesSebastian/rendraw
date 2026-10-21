@@ -1,8 +1,19 @@
 import { Render } from "../../Render";
 import { Vector } from "../common/Vector";
+import { svgEscape } from "./svg";
 
 /** Supported export formats for canvas output. */
-export type ExportFormat = "png" | "jpeg" | "webp" | "json";
+export type ExportFormat = "png" | "jpeg" | "webp" | "json" | "svg";
+
+/** Options for {@link Exporter.exportSVG}. All fields are optional. */
+export interface ExportSVGProps {
+    /** Optional crop start (top-left) in world coordinates. */
+    cutStart?: Vector;
+    /** Optional crop end (bottom-right) in world coordinates. */
+    cutEnd?: Vector;
+    /** Optional background fill for the SVG root. Defaults to none (transparent). */
+    background?: string;
+}
 
 /** Quality levels for image exports. */
 export type ExportQuality = "low" | "medium" | "high";
@@ -108,6 +119,16 @@ export class Exporter {
         window.addEventListener("mousedown", this._onBoundResizeStart);
         window.addEventListener("mousemove", this._onBoundResize);
         window.addEventListener("mouseup", this._onBoundResizeEnd);
+    }
+
+    /**
+     * Removes the window listeners this exporter registered.
+     * Call before discarding the exporter to avoid leaking handlers.
+     */
+    public destroy(): void {
+        window.removeEventListener("mousedown", this._onBoundResizeStart);
+        window.removeEventListener("mousemove", this._onBoundResize);
+        window.removeEventListener("mouseup", this._onBoundResizeEnd);
     }
 
     /**
@@ -230,7 +251,7 @@ export class Exporter {
         this._render.ctx.save();
         this._render.ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
         this._render.ctx.beginPath();
-        this._render.ctx.rect(0, 0, this._render.canvas.width, this._render.canvas.height);
+        this._render.ctx.rect(0, 0, this._render.cssWidth, this._render.cssHeight);
         this._render.ctx.rect(this._cutStart!.x, this._cutStart!.y, this._cutEnd!.x - this._cutStart!.x, this._cutEnd!.y - this._cutStart!.y);
         this._render.ctx.strokeStyle = "rgba(255, 255, 255, 1)";
         this._render.ctx.lineWidth = 2;
@@ -309,7 +330,7 @@ export class Exporter {
         const distance = 100;
         this._isCutting = true;
         this._cutStart = new Vector(distance, distance);
-        this._cutEnd = new Vector(this._render.canvas.width - distance, this._render.canvas.height - distance);
+        this._cutEnd = new Vector(this._render.cssWidth - distance, this._render.cssHeight - distance);
     }
 
     /**
@@ -381,6 +402,16 @@ export class Exporter {
     public async export(props: ExportProps & { scale?: number; jpegQuality?: number }): Promise<Blob> {
         const { format, quality, cutStart, cutEnd, scale = 1, jpegQuality = 0.95 } = props;
 
+        // SVG is a vector format with no raster scaling; produce a text blob by
+        // composing each shape's _toSVG(). The raster contract below is untouched.
+        if (format === "svg") {
+            const svgProps: ExportSVGProps = {};
+            if (cutStart) svgProps.cutStart = cutStart;
+            if (cutEnd) svgProps.cutEnd = cutEnd;
+            const markup = await this.exportSVG(svgProps);
+            return new Blob([markup], { type: "image/svg+xml" });
+        }
+
         const target = this._render.snapSmart.getTarget();
         this._render.preExport();
         this.hideExportCut();
@@ -392,7 +423,11 @@ export class Exporter {
             }
 
             const originalCanvas = this._render.canvas;
-            let cropX = 0, cropY = 0, cropWidth = originalCanvas.width, cropHeight = originalCanvas.height;
+            // Crop coordinates (the cut region and mouse-driven handles) live in
+            // CSS pixels. The source canvas backing store is in device pixels
+            // (scaled by the DPR in Render.resize), so the full-canvas default is
+            // the CSS size and the source rect is converted to device pixels below.
+            let cropX = 0, cropY = 0, cropWidth = this._render.cssWidth, cropHeight = this._render.cssHeight;
             if (cutStart && cutEnd) {
                 cropX = Math.min(cutStart.x, cutEnd.x);
                 cropY = Math.min(cutStart.y, cutEnd.y);
@@ -400,7 +435,7 @@ export class Exporter {
                 cropHeight = Math.abs(cutEnd.y - cutStart.y);
             }
 
-            const ratio = window.devicePixelRatio || 1;
+            const ratio = this._render.devicePixelRatio;
             const qualityScale = this._getScaleFactor(quality ?? "high");
             const finalScale = scale * qualityScale * ratio;
 
@@ -417,9 +452,11 @@ export class Exporter {
                 ctx.fillRect(0, 0, cropWidth, cropHeight);
             }
 
+            // Source rect in device pixels (CSS crop * DPR); destination in CSS
+            // units with the context scaled by finalScale.
             ctx.drawImage(
                 originalCanvas,
-                cropX, cropY, cropWidth, cropHeight,
+                cropX * ratio, cropY * ratio, cropWidth * ratio, cropHeight * ratio,
                 0, 0, cropWidth, cropHeight
             );
 
@@ -441,6 +478,47 @@ export class Exporter {
                 this._render.snapSmart.bind(target);
             }
         }
+    }
+
+    /**
+     * Exports the scene as SVG vector markup (E4).
+     *
+     * Unlike {@link export} (which returns a raster `Blob` and requires a `name`),
+     * this returns a string and takes only optional props. Each shape contributes
+     * its own `_toSVG()` fragment, composed in back-to-front z-order so the stack
+     * matches the canvas. When `cutStart`/`cutEnd` are given, the SVG `viewBox`
+     * frames that world-space region; otherwise it frames the whole canvas.
+     *
+     * @param props - Optional crop region and background.
+     * @returns A promise resolving to the SVG document markup.
+     */
+    public async exportSVG(props: ExportSVGProps = {}): Promise<string> {
+        const { cutStart, cutEnd, background } = props;
+
+        // Back-to-front: render.childs is top-most first, so reverse a copy.
+        const ordered = [...this._render.childs].reverse();
+        const body = ordered.map((shape) => shape._toSVG()).filter((s) => s.length > 0).join("");
+
+        let minX = 0;
+        let minY = 0;
+        let width = this._render.cssWidth;
+        let height = this._render.cssHeight;
+        if (cutStart && cutEnd) {
+            minX = Math.min(cutStart.x, cutEnd.x);
+            minY = Math.min(cutStart.y, cutEnd.y);
+            width = Math.abs(cutEnd.x - cutStart.x);
+            height = Math.abs(cutEnd.y - cutStart.y);
+        }
+
+        const bg = background
+            ? `<rect x="${minX}" y="${minY}" width="${width}" height="${height}" fill="${svgEscape(background)}" />`
+            : "";
+
+        return (
+            `<svg xmlns="http://www.w3.org/2000/svg" ` +
+            `width="${width}" height="${height}" ` +
+            `viewBox="${minX} ${minY} ${width} ${height}">${bg}${body}</svg>`
+        );
     }
 
 }

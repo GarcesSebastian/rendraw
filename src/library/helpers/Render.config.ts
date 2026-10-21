@@ -1,12 +1,12 @@
 import { Vector } from "../instances/common/Vector";
 import { Render } from "../Render";
-import { v4 as uuidv4 } from "uuid";
 import type { RenderEventsType } from "../providers/Render.provider";
 import { Shape, type ShapeRawData } from "../instances/Shape";
 import { Rect, type RectRawData } from "../instances/_shapes/Rect";
 import { Circle, type CircleRawData } from "../instances/_shapes/Circle";
 import { Text, type TextRawData } from "../instances/_shapes/Text";
 import { Image, type ImageRawData } from "../instances/_shapes/Image";
+import { validateShapes } from "../validation/schemas";
 
 /**
  * Interface defining keyboard shortcut mappings for canvas operations.
@@ -49,6 +49,46 @@ export interface RenderConfigurationProps {
     transform: boolean,
     selection: boolean,
     save: AutoSaveMethods,
+    /**
+     * Enables Pointer Events handling for touch and pen input (E1). When true
+     * (the default), rendraw emits `pointerdown`/`pointermove`/`pointerup` with a
+     * `pointerType` and recognises touch gestures. Mouse behaviour is unaffected
+     * either way.
+     */
+    touch?: boolean,
+    /**
+     * Enables two-finger pinch-to-zoom (E1). Defaults to true when `zoom` is on.
+     * Only takes effect when `touch` is enabled.
+     */
+    pinchZoom?: boolean,
+    /**
+     * Enables one/two-finger touch panning (E1). Defaults to true when `pan` is
+     * on. Only takes effect when `touch` is enabled.
+     */
+    touchPan?: boolean,
+    /**
+     * When false (the default), pasting an image URL does NOT load the remote
+     * image, and remote-image shapes in stored/pasted data are dropped during
+     * validation. Local `File`/data-URL pastes are unaffected.
+     *
+     * When true, remote images are loaded with `crossOrigin="anonymous"`. Note
+     * the browser consequence: a cross-origin image whose server does not grant
+     * CORS still displays, but it taints the canvas, which makes raster export
+     * (`toDataURL`/`toBlob`/`getImageData`) throw a `SecurityError`. Only enable
+     * this when you trust the image origins and have CORS configured.
+     */
+    allowRemoteImages: boolean,
+    /**
+     * Maximum number of undo/redo snapshots retained. Older snapshots are
+     * evicted once the cap is exceeded. Defaults to 100.
+     */
+    historyMaxEntries?: number,
+    /**
+     * Optional cap on the total serialized size (in bytes) of all retained
+     * undo/redo snapshots. When set, the oldest snapshots are evicted to stay
+     * within budget (the current snapshot is always kept). Defaults to unset.
+     */
+    historyMaxBytes?: number,
     keywords: Keys,
     properties: Properties
 }
@@ -83,6 +123,8 @@ export class RenderConfiguration {
     /** Store bound functions to ensure proper removal */
     private _boundHandleKeyDown: (event: KeyboardEvent) => void;
     private _boundPasteContent: (event: ClipboardEvent) => void;
+    /** Whether the keyboard/paste listeners are currently attached. */
+    private _listenersBound: boolean = false;
 
     /**
      * Creates a new RenderConfiguration instance.
@@ -223,6 +265,16 @@ export class RenderConfiguration {
         if (textData) {
             const imageUrlPattern = /^https?:\/\/.*\.(jpg|jpeg|png|gif|bmp|webp|svg)(\?.*)?$/i;
             if (imageUrlPattern.test(textData.trim())) {
+                // Remote-image loading is gated behind an explicit opt-in (B3).
+                // Loading an arbitrary remote URL has privacy/CORS/canvas-tainting
+                // implications, so by default a pasted image URL is ignored.
+                if (!this._config.allowRemoteImages) {
+                    console.warn(
+                        "[rendraw] ignoring pasted image URL: remote images are disabled " +
+                        "(set allowRemoteImages: true to enable)"
+                    );
+                    return;
+                }
                 this._render.creator.Image({
                     src: textData.trim(),
                     position: new Vector(this._render.mousePosition().x, this._render.mousePosition().y),
@@ -253,11 +305,27 @@ export class RenderConfiguration {
             this._keywords[key] = value.split("+");
         });
         
-        document.removeEventListener("keydown", this._boundHandleKeyDown);
-        window.removeEventListener("paste", this._boundPasteContent);
-        
+        // Only detach if we previously attached, so add/remove stay symmetric
+        // (a blind remove on first setup would leave removes outnumbering adds).
+        if (this._listenersBound) {
+            document.removeEventListener("keydown", this._boundHandleKeyDown);
+            window.removeEventListener("paste", this._boundPasteContent);
+        }
+
         document.addEventListener("keydown", this._boundHandleKeyDown);
         window.addEventListener("paste", this._boundPasteContent);
+        this._listenersBound = true;
+    }
+
+    /**
+     * Removes the keyboard and paste listeners this configuration registered.
+     * Call before discarding the renderer so the handlers do not leak.
+     */
+    public destroy(): void {
+        if (!this._listenersBound) return;
+        document.removeEventListener("keydown", this._boundHandleKeyDown);
+        window.removeEventListener("paste", this._boundPasteContent);
+        this._listenersBound = false;
     }
 
     /**
@@ -391,9 +459,17 @@ export class RenderConfiguration {
      */
     public pasteNodes(data: ShapeRawData[]): void {
         try {
+            // Clipboard content is untrusted. Validate/repair before instancing:
+            // malformed shapes are dropped (with a warning) and a fresh id is
+            // assigned to every pasted node so duplicates never collide.
+            const validated = validateShapes(data, {
+                allowRemoteImages: this._config.allowRemoteImages,
+                assignMissingIds: true,
+            });
+
             const shapes: Shape[] = [];
-            data.forEach((child: ShapeRawData) => {
-                child.id = uuidv4();
+            validated.forEach((child: ShapeRawData) => {
+                child.id = crypto.randomUUID();
                 if (child.type === "rect") {
                     shapes.push(Rect._fromRawData(child as RectRawData, this._render));
                 } else if (child.type === "circle") {
@@ -526,6 +602,9 @@ export class RenderConfiguration {
             transform: false,
             selection: false,
             save: null,
+            touch: true,
+            allowRemoteImages: false,
+            historyMaxEntries: 100,
             keywords: RenderConfiguration.defaultKeyWords(),
             properties: RenderConfiguration.defaultProperties()
         }

@@ -71,8 +71,8 @@ export class Camera {
      * @param pointer - The world position to bind to.
      */
     public bind(pointer: Vector): void {
-        this.maxOffset.x = pointer.x - this._render.canvas.width / 2;
-        this.maxOffset.y = pointer.y - this._render.canvas.height / 2;
+        this.maxOffset.x = pointer.x - this._render.cssWidth / 2;
+        this.maxOffset.y = pointer.y - this._render.cssHeight / 2;
         this._binded = true;
     }
 

@@ -1,4 +1,3 @@
-import { v4 as uuidv4 } from 'uuid';
 import { Vector } from "./common/Vector";
 import { Render } from "../Render";
 import { ShapeManager } from "../managers/Shape.manager";
@@ -7,7 +6,7 @@ import { ShapeProvider } from "../providers/Shape.provider";
 export type ShapeRawData = {
     id: string;
     type: ShapeType;
-    position: Vector;
+    position: { x: number; y: number };
     rotation: number;
     zIndex: number;
     dragging: boolean;
@@ -22,7 +21,16 @@ export interface IShape {
     visible?: boolean;
 }
 
-export type ShapeType = "circle" | "rect" | "text" | "image";
+export type ShapeType =
+    | "circle"
+    | "rect"
+    | "text"
+    | "image"
+    | "line"
+    | "arrow"
+    | "polygon"
+    | "path"
+    | "pen";
 
 /**
  * Abstract base class for all shape primitives in the rendering system.
@@ -42,8 +50,8 @@ export abstract class Shape extends ShapeProvider {
 
     /** Position vector of the shape's origin (top-left corner) in pixels. */
     public position: Vector;
-    /** The stacking order of the shape. Higher values are drawn on top. */
-    public zIndex: number;
+    /** Backing field for {@link zIndex}. */
+    private _zIndex: number = 0;
     /** Rotation of the shape in radians, relative to its origin. */
     public rotation: number;
     /** Indicates if the shape is currently being dragged by the user. */
@@ -57,12 +65,6 @@ export abstract class Shape extends ShapeProvider {
     
     /** Manages shape-specific functionalities and properties. */
     public manager: ShapeManager;
-    /** 
-     * @internal
-     * The transformer instance attached to this shape, if any. 
-     * Manages resize and rotation handles. Null if not selected.
-     */
-    public _transformer: Transformer | null = null;
 
     /**
      * Creates a new Shape instance.
@@ -79,7 +81,7 @@ export abstract class Shape extends ShapeProvider {
         this.position = props.position ?? new Vector(0, 0);
         this.zIndex = props.zIndex ?? 0;
         this.rotation = props.rotation ?? 0;
-        this._id = id ?? uuidv4();
+        this._id = id ?? crypto.randomUUID();
         this.manager = new ShapeManager(this);
         this.dragging = props.dragging ?? false;
         this.visible = props.visible ?? true;
@@ -87,9 +89,6 @@ export abstract class Shape extends ShapeProvider {
 
         this._render = render;
         this._render.manager.addChild(this);
-
-        if (this.zIndex > this._render._maxZIndex) this._render._maxZIndex = this.zIndex;
-        if (this.zIndex < this._render._minZIndex) this._render._minZIndex = this.zIndex;
     }
 
     /**
@@ -114,6 +113,23 @@ export abstract class Shape extends ShapeProvider {
      */
     public get render() : Render {
         return this._render;
+    }
+
+    /**
+     * The stacking order of the shape. Higher values are drawn on top.
+     * Writing it invalidates the render's cached z-order so the next frame and
+     * the next hit test reflect the new order.
+     */
+    public get zIndex(): number {
+        return this._zIndex;
+    }
+
+    public set zIndex(value: number) {
+        if (value === this._zIndex) return;
+        this._zIndex = value;
+        // `_render` is assigned at the end of the constructor; the initial write
+        // happens before that and is covered by the invalidate in `addChild`.
+        this._render?.invalidateZOrder();
     }
 
     /**
@@ -160,8 +176,7 @@ export abstract class Shape extends ShapeProvider {
      * @returns The shape instance.
      */
     public setFront(): Shape {
-        this._render._maxZIndex += 1;
-        this.zIndex = this._render._maxZIndex;
+        this.zIndex = this._render.manager.bumpToFront();
         return this;
     }
 
@@ -170,8 +185,7 @@ export abstract class Shape extends ShapeProvider {
      * @returns The shape instance.
      */
     public setBack(): Shape {
-        this._render._minZIndex -= 1;
-        this.zIndex = this._render._minZIndex;
+        this.zIndex = this._render.manager.bumpToBack();
         return this;
     }
 
@@ -227,6 +241,17 @@ export abstract class Shape extends ShapeProvider {
     public abstract _rawData() : ShapeRawData;
 
     /**
+     * @internal
+     * Returns an SVG fragment representing this shape in world coordinates, used
+     * by {@link Exporter.exportSVG} to compose a vector export. The base
+     * implementation returns an empty string; concrete shapes override it.
+     * @returns SVG markup for this shape (may be an empty string).
+     */
+    public _toSVG(): string {
+        return "";
+    }
+
+    /**
      * Creates a new shape instance from raw data.
      * @param _data - The raw data of the shape.
      * @param _render - The render instance.
@@ -243,6 +268,9 @@ export abstract class Shape extends ShapeProvider {
      */
     public destroy() : void {
         this.emit("destroy", {});
+        // E5: broadcast a granular remove patch (suppressed while a remote patch
+        // is being applied, via Render.emitPatch's internal guard).
+        this._render.emitPatch({ op: "remove", id: this.id, type: this.type });
         this._render.manager.removeChild(this);
 
         if (this.render.transformer && this.render.transformer.inTransformer(this)) {
@@ -250,9 +278,9 @@ export abstract class Shape extends ShapeProvider {
         }
 
         if (this.render.database) {
-            const table = this.render.database.getTable("nodes" as never)
+            const table = this.render.database.getTable("nodes")
             if (table) {
-                table.delete(this.id as never)
+                table.delete(this.id)
             }
         }
     }

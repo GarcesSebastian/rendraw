@@ -1,6 +1,7 @@
 import { Render } from "../../Render";
 import { Vector } from "../common/Vector";
 import { Shape, IShape, ShapeRawData } from "../Shape";
+import { svgEscape, svgNum, svgTransform } from "../utils/svg";
 
 export type TextRawData = ShapeRawData & {
     text: string;
@@ -93,6 +94,11 @@ export class Text extends Shape {
     private _editing: boolean = false;
     /** DOM textarea element used for in-place editing. */
     private _textarea: HTMLTextAreaElement | null = null;
+    /** Stored dblclick handler so it can be removed on destroy. */
+    private _onDblClick: () => void = () => {
+        this._editing = !this._editing;
+        this._setupEditor();
+    };
     
     /**
      * Creates a new text shape.
@@ -151,10 +157,21 @@ export class Text extends Shape {
      * @private
      */
     private _events(): void {
-        this.on("dblclick", () => {
-            this._editing = !this._editing;
-            this._setupEditor();
-        })
+        this.on("dblclick", this._onDblClick);
+    }
+
+    /**
+     * Removes the text element from the renderer and tears down its editor.
+     * Detaches the persistent dblclick handler and removes the in-place
+     * textarea from the DOM if it is still open, then runs the base cleanup.
+     */
+    public override destroy(): void {
+        this.off("dblclick", this._onDblClick);
+        if (this._textarea) {
+            this._editing = false;
+            this._disolveEditor();
+        }
+        super.destroy();
     }
 
     /**
@@ -657,7 +674,7 @@ export class Text extends Shape {
         return {
             id: this.id,
             type: "text",
-            position: this.position,
+            position: { x: this.position.x, y: this.position.y },
             rotation: this.rotation,
             zIndex: this.zIndex,
             dragging: this.dragging,
@@ -676,6 +693,55 @@ export class Text extends Shape {
             width: this.width,
             height: this.height
         }
+    }
+
+    /**
+     * @internal
+     * Returns an SVG `<text>` fragment (with an optional background rect) for
+     * this text element in world coordinates. Multiple lines become `<tspan>`s.
+     * @returns SVG markup for the text.
+     */
+    public override _toSVG(): string {
+        if (!this.visible) return "";
+        this._calculateTextMetrics();
+
+        const offsetX = this._getTextOffsetX();
+        const lineHeight = this.fontSize * 1.2;
+        const lines = this.value.split("\n");
+
+        let background = "";
+        const hasBg = this.backgroundColor && this.backgroundColor !== "transparent";
+        if (hasBg || this.borderWidth > 0) {
+            const rectX = offsetX - this.padding.left;
+            const rectY = -this._ascent - this.padding.top;
+            const rectW = this._width + this.padding.left + this.padding.right;
+            const rectH = this._height + this.padding.top + this.padding.bottom;
+            const fill = hasBg ? svgEscape(this.backgroundColor) : "none";
+            const stroke = this.borderWidth > 0
+                ? ` stroke="${svgEscape(this.borderColor)}" stroke-width="${svgNum(this.borderWidth)}"`
+                : "";
+            background = `<rect x="${svgNum(rectX)}" y="${svgNum(rectY)}" width="${svgNum(rectW)}" height="${svgNum(rectH)}" fill="${fill}"${stroke} />`;
+        }
+
+        const anchor = this.textAlign === "center"
+            ? "middle"
+            : this.textAlign === "right" || this.textAlign === "end"
+                ? "end"
+                : "start";
+
+        const tspans = lines
+            .map((line, index) =>
+                `<tspan x="0" y="${svgNum(index * lineHeight)}">${svgEscape(line)}</tspan>`
+            )
+            .join("");
+
+        const text =
+            `<text x="0" y="0" fill="${svgEscape(this.color)}" ` +
+            `font-family="${svgEscape(this.fontFamily)}" font-size="${svgNum(this.fontSize)}" ` +
+            `font-weight="${svgEscape(this.fontWeight)}" font-style="${svgEscape(this.fontStyle)}" ` +
+            `text-anchor="${anchor}">${tspans}</text>`;
+
+        return `<g transform="${svgTransform(this.position.x, this.position.y, this.rotation)}">${background}${text}</g>`;
     }
 
     /**

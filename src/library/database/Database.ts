@@ -472,34 +472,6 @@ export class Database<TSchema extends Record<string, TableSchema> = {}> {
     }
 
     /**
-     * Executes complex queries on a table using web workers for performance.
-     * @template TName - The table name type.
-     * @param tableName - The name of the table to query.
-     * @param queryType - Type of query: 'FILTER_LARGE_DATASET' or 'AGGREGATE'.
-     * @param params - Query parameters including filter/aggregate code and parameters.
-     * @param useWorker - Whether to use web worker for processing (default: true).
-     * @returns Promise resolving to the query result.
-     */
-    public async complexQuery<TName extends TableName<TSchema>>(
-        tableName: TName,
-        queryType: 'FILTER_LARGE_DATASET' | 'AGGREGATE',
-        params: any,
-        useWorker: boolean = true
-    ): Promise<any> {
-        if (useWorker) {
-            return this._sendToWorker('COMPLEX_QUERY', {
-                tableName,
-                queryType,
-                params
-            });
-        }
-        
-        const table = this.get(tableName);
-        if (!table) throw new Error(`Table '${tableName}' not found`);
-        return table.getAll();
-    }
-
-    /**
      * Gets the underlying IndexedDB database instance.
      * @returns The IndexedDB database instance.
      * @throws Error if database is not initialized.

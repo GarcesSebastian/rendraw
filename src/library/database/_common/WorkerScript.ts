@@ -1,6 +1,14 @@
 /**
  * IndexedDB Web Worker Script for high-performance database operations.
- * Handles bulk operations, complex queries, and database size calculations in a separate thread.
+ * Handles bulk insert/update/delete operations and database size calculations
+ * in a separate thread.
+ *
+ * Security note: this worker never executes code transported as a string. The
+ * previous `COMPLEX_QUERY` path built predicates with `new Function(...)` from
+ * caller-supplied source; it was removed. `find`/`aggregate` now run their
+ * predicate on the main thread (see Table.find / Table.aggregate), so no code
+ * string ever crosses the worker boundary and the library works under a CSP
+ * without `unsafe-eval`.
  */
 
 /**
@@ -238,38 +246,6 @@ function getDatabaseSize() {
     });
 }
 
-async function complexQuery(tableName, queryType, params) {
-    if (!db) throw new Error('Database not opened in worker');
-    
-    const transaction = db.transaction([tableName], 'readonly');
-    const store = transaction.objectStore(tableName);
-    
-    switch (queryType) {
-        case 'FILTER_LARGE_DATASET':
-            const allRecords = await new Promise((resolve, reject) => {
-                const request = store.getAll();
-                request.onsuccess = () => resolve(request.result);
-                request.onerror = () => reject(request.error);
-            });
-            
-            const filterFn = new Function('record', 'params', params.filterCode);
-            return allRecords.filter(record => filterFn(record, params.filterParams));
-            
-        case 'AGGREGATE':
-            const records = await new Promise((resolve, reject) => {
-                const request = store.getAll();
-                request.onsuccess = () => resolve(request.result);
-                request.onerror = () => reject(request.error);
-            });
-            
-            const aggregateFn = new Function('records', 'params', params.aggregateCode);
-            return aggregateFn(records, params.aggregateParams);
-            
-        default:
-            throw new Error('Unknown query type');
-    }
-}
-
 self.onmessage = async function(event) {
     const { id, type, payload } = event.data;
     
@@ -298,10 +274,6 @@ self.onmessage = async function(event) {
                 
             case 'GET_SIZE':
                 result = await getDatabaseSize();
-                break;
-                
-            case 'COMPLEX_QUERY':
-                result = await complexQuery(payload.tableName, payload.queryType, payload.params);
                 break;
                 
             default:

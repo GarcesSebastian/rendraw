@@ -51,8 +51,8 @@ export class Transformer extends TransformerProvider {
     /** The rendering engine instance for drawing operations. */
     public _render: Render;
 
-    /** Map of selected shapes indexed by their ID. */
-    public _childs: Map<string, Shape> = new Map();
+    /** Map of selected shapes indexed by their ID. Exposed via {@link childs}. */
+    private _childs: Map<string, Shape> = new Map();
     /** Padding around the transformer boundary for visual spacing. */
     public padding: Padding = { top: 0, right: 0, bottom: 0, left: 0 };
     /** Configuration for the transformer's appearance. */
@@ -131,6 +131,13 @@ export class Transformer extends TransformerProvider {
     /** Indicates if the transformer is currently hidden. */
     private _isHidden: boolean = false;
 
+    /** Bound keydown handler, stored once so it can be removed on destroy. */
+    private _onKeyDownBound: (event: KeyboardEvent) => void = this._onKeyDown.bind(this);
+    /** Bound mousemove handler, stored once so it can be removed on destroy. */
+    private _onMouseMoveBound: (event: MouseEvent) => void = this._onMouseMove.bind(this);
+    /** Bound mouseup handler, stored once so it can be removed on destroy. */
+    private _onMouseUpBound: (event: MouseEvent) => void = this._onMouseUp.bind(this);
+
     /**
      * Creates a new Transformer instance.
      * @param render - The main Render context for drawing operations.
@@ -199,9 +206,19 @@ export class Transformer extends TransformerProvider {
     private _events(): void {
         this._render.on("mousedown", this._onMouseDown.bind(this));
         this._render.on("click", this._onCanvasClick.bind(this));
-        window.addEventListener("keydown", this._onKeyDown.bind(this));
-        window.addEventListener("mousemove", this._onMouseMove.bind(this));
-        window.addEventListener("mouseup", this._onMouseUp.bind(this));
+        window.addEventListener("keydown", this._onKeyDownBound);
+        window.addEventListener("mousemove", this._onMouseMoveBound);
+        window.addEventListener("mouseup", this._onMouseUpBound);
+    }
+
+    /**
+     * Removes the window listeners this transformer registered.
+     * Call before discarding the transformer to avoid leaking handlers.
+     */
+    public destroy(): void {
+        window.removeEventListener("keydown", this._onKeyDownBound);
+        window.removeEventListener("mousemove", this._onMouseMoveBound);
+        window.removeEventListener("mouseup", this._onMouseUpBound);
     }
 
     /**
@@ -290,6 +307,12 @@ export class Transformer extends TransformerProvider {
     private _onMouseMove(): void {
         if (!this._render.configuration.config.transform) return;
         const currentMousePos = this._render.worldPosition();
+
+        // Any move/resize below mutates shape geometry; flag the scene so the
+        // autosave on mouse-up re-serializes instead of skipping as a no-op.
+        if (this._isMovingSelection || this._isDragging) {
+            this._render.markDirty();
+        }
 
         if (this._isMovingSelection && !this._isDragging) {
             const delta = currentMousePos.sub(this._lastMousePos);

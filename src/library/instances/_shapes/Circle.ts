@@ -1,6 +1,7 @@
 import { IShape, Shape, ShapeRawData } from "../Shape";
 import { Render } from "../../Render";
 import { Vector } from "../common/Vector";
+import { svgEscape, svgNum } from "../utils/svg";
 
 export type CircleRawData = ShapeRawData & {
     radius: number;
@@ -173,7 +174,7 @@ export class Circle extends Shape {
         return {
             id: this.id,
             type: "circle",
-            position: this.position,
+            position: { x: this.position.x, y: this.position.y },
             rotation: this.rotation,
             zIndex: this.zIndex,
             dragging: this.dragging,
@@ -185,12 +186,23 @@ export class Circle extends Shape {
 
     /**
      * @internal
+     * Returns an SVG `<circle>` fragment for this circle in world coordinates.
+     * The circle is drawn centered on its position, matching the canvas path.
+     * @returns SVG markup for the circle.
+     */
+    public override _toSVG(): string {
+        if (!this.visible) return "";
+        return `<circle cx="${svgNum(this.position.x)}" cy="${svgNum(this.position.y)}" r="${svgNum(this.radius)}" fill="${svgEscape(this.color)}" />`;
+    }
+
+    /**
+     * @internal
      * Creates a new circle instance from raw data.
      * @param data - The raw data of the circle.
      * @returns A new `Circle` instance with identical properties.
      */
     public static _fromRawData(data: CircleRawData, render: Render) : Circle {
-        const circle = new Circle(data, render, data.id);
+        const circle = new Circle({ ...data, position: new Vector(data.position.x, data.position.y) }, render, data.id);
         circle.position = new Vector(data.position.x, data.position.y);
         circle.rotation = data.rotation;
         circle.zIndex = data.zIndex;

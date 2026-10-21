@@ -127,8 +127,8 @@ export class SnapSmart {
         this._snapDistance = this._render.toWorldCoordinates(new Vector(0, 0))
             .sub(this._render.toWorldCoordinates(
                 new Vector(
-                    this._render.canvas.width,
-                    this._render.canvas.height
+                    this._render.cssWidth,
+                    this._render.cssHeight
                 )
             )).len();
 
@@ -314,7 +314,7 @@ export class SnapSmart {
         if (!this._sides) return;
 
         const { left, top } = this._render.canvas.getBoundingClientRect();
-        const viewportCenter = this._render.toWorldCoordinates(new Vector(this._render.canvas.width / 2, this._render.canvas.height / 2));
+        const viewportCenter = this._render.toWorldCoordinates(new Vector(this._render.cssWidth / 2, this._render.cssHeight / 2));
         const offset = this._render.getOffset();
         viewportCenter.x += offset.x;
         viewportCenter.y += offset.y;
@@ -867,7 +867,7 @@ export class SnapSmart {
      */
     private drawViewportCenter(offset: Vector, zoom: number): void {
         const viewportCenter = this._render.toWorldCoordinates(
-            new Vector(this._render.canvas.width / 2, this._render.canvas.height / 2)
+            new Vector(this._render.cssWidth / 2, this._render.cssHeight / 2)
         );
         const renderOffset = this._render.getOffset();
         viewportCenter.x += renderOffset.x;
@@ -912,7 +912,7 @@ export class SnapSmart {
     private addGuideLineX(x: number, isViewport: boolean = false, isSpacing: boolean = false): void {
         const offset = this._render.getOffset();
         const topLeft = this._render.toWorldCoordinates(Vector.zero).add(offset);
-        const bottomRight = this._render.toWorldCoordinates(new Vector(this._render.canvas.width, this._render.canvas.height)).add(offset);
+        const bottomRight = this._render.toWorldCoordinates(new Vector(this._render.cssWidth, this._render.cssHeight)).add(offset);
 
         const y1 = topLeft.y;
         const y2 = bottomRight.y;
@@ -931,7 +931,7 @@ export class SnapSmart {
     private addGuideLineY(y: number, isViewport: boolean = false, isSpacing: boolean = false): void {
         const offset = this._render.getOffset();
         const topLeft = this._render.toWorldCoordinates(Vector.zero).add(offset);
-        const bottomRight = this._render.toWorldCoordinates(new Vector(this._render.canvas.width, this._render.canvas.height)).add(offset);
+        const bottomRight = this._render.toWorldCoordinates(new Vector(this._render.cssWidth, this._render.cssHeight)).add(offset);
         
         const x1 = topLeft.x;
         const x2 = bottomRight.x;

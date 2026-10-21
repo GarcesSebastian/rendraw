@@ -1,7 +1,7 @@
 import { RenderCreator } from "./helpers/Render.creator";
 import { Vector } from "./instances/common/Vector";
 import { RenderManager } from "./managers/Render.manager";
-import { RenderProvider } from "./providers/Render.provider";
+import { RenderProvider, type Patch, type PointerKind, type RenderEventPointer } from "./providers/Render.provider";
 import { RenderConfiguration, type RenderConfigurationProps } from "./helpers/Render.config";
 import { Camera } from "./instances/common/Camera";
 import { History } from "./instances/utils/History";
@@ -11,17 +11,22 @@ import { Rect, type RectRawData } from "./instances/_shapes/Rect";
 import { Circle, type CircleRawData } from "./instances/_shapes/Circle";
 import { Text, type TextRawData } from "./instances/_shapes/Text";
 import { Image, type ImageRawData } from "./instances/_shapes/Image";
+import { Line, type LineRawData } from "./instances/_shapes/Line";
+import { Arrow, type ArrowRawData } from "./instances/_shapes/Arrow";
+import { Polygon, type PolygonRawData } from "./instances/_shapes/Polygon";
+import { Path, type PathRawData } from "./instances/_shapes/Path";
+import { Pen, type PenRawData } from "./instances/_shapes/Pen";
 import { Selection } from "./instances/utils/Selection";
 import { Transformer } from "./instances/common/Transformer";
 import { Database } from "./database/Database";
-import { ConfigurationSchema, NodeSchema } from "./types/Schemas";
+import type { Table } from "./database/_common/Table";
+import type { ConfigurationSchema, NodeSchema, RenderDatabaseSchema } from "./types/Schemas";
 import { Exporter } from "./instances/utils/Exporter";
+import type { RenderProperties } from "./types/Properties";
+import { validateShapes, validateProperties } from "./validation/schemas";
+import { EnvironmentError, isBrowserEnvironment } from "./environment";
 
-export interface RenderProperties {
-    zoom: number;
-    globalPosition: Vector;
-    offsetPan: Vector;
-}
+export type { RenderProperties };
 
 /**
  * Main rendering system class.
@@ -58,7 +63,7 @@ export class Render extends RenderProvider {
     public exporter: Exporter;
 
     /** Database instance for data persistence. */
-    private _database: Database | null = null;
+    private _database: Database<RenderDatabaseSchema> | null = null;
     /** Last serialized data string for comparison to avoid unnecessary saves. */
     private _lastSerializedData: string = "";
     /** Callback function for saving progress updates. */
@@ -67,6 +72,13 @@ export class Render extends RenderProvider {
     public onLoadProgress: ((progress: { p: number; state: boolean }) => void) | null = null;
     /** Debounce timeout for configuration-only saves. */
     private _configSaveTimeout: number | null = null;
+
+    /**
+     * Single source of truth for every DOM listener this instance registers.
+     * `events()` pushes into it and attaches from it; `destroy()`/`cleanup()`
+     * iterate the SAME entries to detach, so add/remove can never drift apart.
+     */
+    private _domListeners: Array<{ target: EventTarget; type: string; handler: EventListener; opts: boolean | AddEventListenerOptions | undefined }> = [];
 
     /** Current animation frame ID. */
     private _frameId: number | null = null
@@ -91,6 +103,24 @@ export class Render extends RenderProvider {
     private _onKeyDownBound: (event: KeyboardEvent) => void = this._onKeyDown.bind(this);
     /** Bound key up function. */
     private _onKeyUpBound: (event: KeyboardEvent) => void = this._onKeyUp.bind(this);
+
+    /** Bound pointer-down handler (E1). */
+    private _onPointerDownBound: (event: PointerEvent) => void = this._onPointerDown.bind(this);
+    /** Bound pointer-move handler (E1). */
+    private _onPointerMoveBound: (event: PointerEvent) => void = this._onPointerMove.bind(this);
+    /** Bound pointer-up handler (E1). */
+    private _onPointerUpBound: (event: PointerEvent) => void = this._onPointerUp.bind(this);
+
+    /**
+     * Active pointers, keyed by `pointerId`, used for touch gesture recognition
+     * (E1). Only touch/pen pointers are tracked here; mouse input keeps flowing
+     * through the existing mouse handlers unchanged.
+     */
+    private _activePointers: Map<number, { x: number; y: number }> = new Map();
+    /** Previous two-pointer distance, for computing the pinch scale delta. */
+    private _lastPinchDistance: number | null = null;
+    /** Previous one/two-pointer centroid, for computing the touch-pan delta. */
+    private _lastTouchCenter: Vector | null = null;
 
     /** Shape currently being dragged. */
     private _draggingShape: Shape | null = null
@@ -133,12 +163,8 @@ export class Render extends RenderProvider {
 
     /** Indicates whether to show FPS counter. */
     public showFps: boolean = false;
-    /** Global canvas position (for panning). */
-    public _globalPosition: Vector = new Vector(0, 0)
-    /** Maximum zIndex value of all shapes. */
-    public _maxZIndex: number = 0
-    /** Minimum zIndex value of all shapes. */
-    public _minZIndex: number = 0
+    /** Global canvas position (for panning). Reach it via {@link globalPosition}. */
+    private _globalPosition: Vector = new Vector(0, 0)
 
     /** Creator for shapes and elements. */
     public creator: RenderCreator;
@@ -149,11 +175,51 @@ export class Render extends RenderProvider {
     private _saveCounter: number = 0;
 
     /**
+     * True while {@link applyPatch} is applying a remote change. Guards the
+     * `patch` emitters so applying an inbound patch does not echo a new `patch`
+     * event back to the network (prevents sync feedback loops).
+     */
+    private _applyingRemote: boolean = false;
+
+    /**
+     * Cached shape list ordered by descending zIndex (top-most first), the same
+     * order the old per-call `sort((a,b) => b.zIndex - a.zIndex)` produced. It is
+     * rebuilt lazily by {@link _getChildrens} only when {@link _zOrderDirty} is
+     * set, instead of sorting every frame and on every input event.
+     */
+    private _zOrderCache: Shape[] | null = null;
+    /** Set whenever the shape set or any shape's zIndex changes. */
+    private _zOrderDirty: boolean = true;
+
+    /** True while an edit has happened since the last autosave serialization. */
+    private _sceneDirty: boolean = true;
+
+    /**
+     * Cached `canvas.getBoundingClientRect()`. The hit-test / coordinate helpers
+     * read this instead of forcing a layout read on every `mousemove`. It is
+     * refreshed on resize/scroll/orientationchange and at drag start, which is
+     * when the canvas's on-screen box can actually move.
+     */
+    private _canvasRect: DOMRect | null = null;
+    /** Bound rect-refresh handler (scroll/resize), stored for clean teardown. */
+    private _refreshRectBound: () => void = this._refreshCanvasRect.bind(this);
+
+    /**
      * Creates a new renderer instance.
      * @param canvas - The HTML canvas element where rendering will be performed.
      */
     public constructor(canvas: HTMLCanvasElement) {
         super();
+
+        // E6: fail fast and clearly under SSR/Node, before any canvas access,
+        // listener registration, or worker is created.
+        if (!isBrowserEnvironment()) {
+            throw new EnvironmentError(
+                "rendraw requires a browser environment (window, document and HTMLCanvasElement). " +
+                "Construct Render (or call createRender) only in the browser."
+            );
+        }
+
         this.canvas = canvas
         this.ctx = canvas.getContext('2d') as CanvasRenderingContext2D
 
@@ -162,7 +228,10 @@ export class Render extends RenderProvider {
         this.configuration = new RenderConfiguration(this)
         this.currentCamera = new Camera(this)
         this.snapSmart = new SnapSmart(this)
-        this.history = new History(this)
+        this.history = new History(this, {
+            maxEntries: this.configuration.config.historyMaxEntries,
+            maxBytes: this.configuration.config.historyMaxBytes,
+        })
         this.transformer = new Transformer(this)
         this.selection = new Selection(this)
         this.exporter = new Exporter(this)
@@ -194,20 +263,57 @@ export class Render extends RenderProvider {
      * @private
      */
     private events(): void {
-        window.addEventListener('resize', this._resizeBound)
-        window.addEventListener("change", this._resizeBound)
-        window.addEventListener("orientationchange", this._resizeBound)
-        window.addEventListener("visibilitychange", this._resizeBound)
+        this._addListener(window, "resize", this._resizeBound)
+        this._addListener(window, "change", this._resizeBound)
+        this._addListener(window, "orientationchange", this._resizeBound)
+        this._addListener(window, "visibilitychange", this._resizeBound)
 
-        window.addEventListener("contextmenu", this._onContextmenuBound)
+        // Refresh the cached canvas rect when the page scrolls (capture phase so
+        // scrolls on any ancestor are seen); passive since we never preventDefault.
+        this._addListener(window, "scroll", this._refreshRectBound, { capture: true, passive: true })
 
-        window.addEventListener("keydown", this._onKeyDownBound)
-        window.addEventListener("keyup", this._onKeyUpBound)
-        window.addEventListener("wheel", this._onMouseWheelBound, { passive: false })
-        window.addEventListener("mousedown", this._onMouseDownBound)
-        window.addEventListener("mousemove", this._onMouseMovedBound)
-        window.addEventListener("mouseup", this._onMouseUpBound)
-        window.addEventListener("click", this._onMouseClickedBound)
+        this._addListener(window, "contextmenu", this._onContextmenuBound as EventListener)
+
+        this._addListener(window, "keydown", this._onKeyDownBound as EventListener)
+        this._addListener(window, "keyup", this._onKeyUpBound as EventListener)
+        this._addListener(window, "wheel", this._onMouseWheelBound as EventListener, { passive: false })
+        this._addListener(window, "mousedown", this._onMouseDownBound as EventListener)
+        this._addListener(window, "mousemove", this._onMouseMovedBound as EventListener)
+        this._addListener(window, "mouseup", this._onMouseUpBound as EventListener)
+        this._addListener(window, "click", this._onMouseClickedBound as EventListener)
+
+        // E1: Pointer Events for touch/pen input and gesture recognition. Bound
+        // to the canvas so gestures are scoped to it. Mouse behaviour continues
+        // to flow through the mouse handlers above; these emit the additive
+        // pointer events and recognise pinch-zoom / touch-pan for touch/pen.
+        if (this.configuration.config.touch !== false) {
+            this._addListener(this.canvas, "pointerdown", this._onPointerDownBound as EventListener)
+            this._addListener(this.canvas, "pointermove", this._onPointerMoveBound as EventListener)
+            this._addListener(this.canvas, "pointerup", this._onPointerUpBound as EventListener)
+            this._addListener(this.canvas, "pointercancel", this._onPointerUpBound as EventListener)
+        }
+    }
+
+    /**
+     * Registers a DOM listener and records it in {@link _listeners} so it can be
+     * removed later from the exact same target/type/handler/options.
+     * @private
+     */
+    private _addListener(target: EventTarget, type: string, handler: EventListener, opts?: boolean | AddEventListenerOptions): void {
+        target.addEventListener(type, handler, opts);
+        this._domListeners.push({ target, type, handler, opts });
+    }
+
+    /**
+     * Removes every listener recorded in {@link _listeners} from the same target
+     * it was added to, then empties the table.
+     * @private
+     */
+    private _removeListeners(): void {
+        for (const { target, type, handler, opts } of this._domListeners) {
+            target.removeEventListener(type, handler, opts);
+        }
+        this._domListeners = [];
     }
 
     private _customEvents(): void {
@@ -242,6 +348,143 @@ export class Render extends RenderProvider {
         if (event.key === "Shift") {
             this._isShiftPressed = false;
         }
+    }
+
+    /**
+     * Builds the pointer-event payload shared by the pointer handlers.
+     * @private
+     */
+    private _getPointerArgs(event: PointerEvent): RenderEventPointer {
+        return {
+            pointer: {
+                absolute: this.mousePosition(),
+                world: this.worldPosition(),
+            },
+            target: this,
+            pointerType: (event.pointerType || "mouse") as PointerKind,
+            pointerId: event.pointerId,
+        };
+    }
+
+    /**
+     * Handles a pointer-down (E1). Emits the additive `pointerdown` event and,
+     * for touch/pen, starts tracking the pointer for gesture recognition.
+     * @private
+     */
+    private _onPointerDown(event: PointerEvent): void {
+        this._mousePosition.x = event.clientX;
+        this._mousePosition.y = event.clientY;
+        this.emit("pointerdown", this._getPointerArgs(event));
+
+        if (event.pointerType === "touch" || event.pointerType === "pen") {
+            this._activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+            this._lastPinchDistance = null;
+            this._lastTouchCenter = this._pointerCentroid();
+        }
+    }
+
+    /**
+     * Handles a pointer-move (E1). Emits `pointermove`, and for two touch
+     * pointers recognises pinch-zoom (emitting `pinch`); for one/two touch
+     * pointers recognises touch-pan.
+     * @private
+     */
+    private _onPointerMove(event: PointerEvent): void {
+        this._mousePosition.x = event.clientX;
+        this._mousePosition.y = event.clientY;
+        this.emit("pointermove", this._getPointerArgs(event));
+
+        if (event.pointerType !== "touch" && event.pointerType !== "pen") return;
+        if (!this._activePointers.has(event.pointerId)) return;
+
+        this._activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        const points = Array.from(this._activePointers.values());
+
+        // Pinch-zoom: exactly two active pointers.
+        if (points.length === 2 && this.configuration.config.touch !== false) {
+            const [a, b] = points as [{ x: number; y: number }, { x: number; y: number }];
+            const distance = Math.hypot(b.x - a.x, b.y - a.y);
+            const center = new Vector((a.x + b.x) / 2, (a.y + b.y) / 2);
+
+            const pinchEnabled = this.configuration.config.pinchZoom ?? this.configuration.config.zoom;
+            if (pinchEnabled && this._lastPinchDistance !== null && this._lastPinchDistance > 0 && distance > 0) {
+                const scale = distance / this._lastPinchDistance;
+                this._applyZoomAround(center, scale);
+                this.emit("pinch", { scale, center });
+            }
+            this._lastPinchDistance = distance;
+        } else {
+            this._lastPinchDistance = null;
+        }
+
+        // Touch pan: track the centroid and pan by its delta.
+        const touchPanEnabled = this.configuration.config.touchPan ?? this.configuration.config.pan;
+        if (touchPanEnabled && this.configuration.config.pan) {
+            const center = this._pointerCentroid();
+            if (center && this._lastTouchCenter && points.length === 1) {
+                const dx = (center.x - this._lastTouchCenter.x) / this._zoom;
+                const dy = (center.y - this._lastTouchCenter.y) / this._zoom;
+                this._offsetPan.x += dx;
+                this._offsetPan.y += dy;
+            }
+            this._lastTouchCenter = center;
+        }
+    }
+
+    /**
+     * Handles a pointer-up / pointer-cancel (E1). Emits `pointerup` and clears
+     * the pointer from gesture tracking.
+     * @private
+     */
+    private _onPointerUp(event: PointerEvent): void {
+        this.emit("pointerup", this._getPointerArgs(event));
+        this._activePointers.delete(event.pointerId);
+        if (this._activePointers.size < 2) this._lastPinchDistance = null;
+        if (this._activePointers.size === 0) this._lastTouchCenter = null;
+    }
+
+    /** Centroid of all active pointers in absolute coordinates, or null. @private */
+    private _pointerCentroid(): Vector | null {
+        const points = Array.from(this._activePointers.values());
+        if (points.length === 0) return null;
+        let sx = 0;
+        let sy = 0;
+        for (const p of points) {
+            sx += p.x;
+            sy += p.y;
+        }
+        return new Vector(sx / points.length, sy / points.length);
+    }
+
+    /**
+     * Applies a multiplicative zoom delta centered on an absolute screen point,
+     * keeping that point stationary in world space (shared by pinch-zoom).
+     * @private
+     */
+    private _applyZoomAround(center: Vector, scale: number): void {
+        if (!this.configuration.config.zoom && !(this.configuration.config.pinchZoom ?? false)) return;
+        const worldBefore = this.toWorldCoordinates(center);
+        this._zoom *= scale;
+
+        const properties = this.configuration.getProperties();
+        if (properties.minZoom && this._zoom < properties.minZoom) this._zoom = properties.minZoom;
+        if (properties.maxZoom && this._zoom > properties.maxZoom) this._zoom = properties.maxZoom;
+
+        const worldAfter = this.toWorldCoordinates(center);
+        this._globalPosition.x += (worldAfter.x - worldBefore.x) * this._zoom;
+        this._globalPosition.y += (worldAfter.y - worldBefore.y) * this._zoom;
+    }
+
+    /**
+     * Gives the canvas keyboard focus (making it focusable first if the consumer
+     * has not set a `tabindex`). Useful for forwarding global shortcuts to a
+     * specific instance (E1/§3 groundwork).
+     */
+    public focus(): void {
+        if (!this.canvas.hasAttribute("tabindex")) {
+            this.canvas.setAttribute("tabindex", "0");
+        }
+        this.canvas.focus();
     }
 
     /**
@@ -281,7 +524,7 @@ export class Render extends RenderProvider {
             this._offsetPan.y -= event.deltaY / this._zoom;
         }
     
-        if (this._wheelTimeout) {
+        if (this._wheelTimeout !== null) {
             clearTimeout(this._wheelTimeout);
         }
         this._wheelTimeout = window.setTimeout(() => {
@@ -304,6 +547,11 @@ export class Render extends RenderProvider {
      * @private
      */
     private _onMouseDown(event: MouseEvent): void {
+        // A drag/pan is about to start: refresh the cached canvas rect once here
+        // so the subsequent per-mousemove hit tests read a correct, layout-free
+        // rect without forcing a layout on every move.
+        this._refreshCanvasRect();
+
         const clickedSelectedShape = this._getChildrens().find((child: Shape) => child._isClicked());
 
         if (event.button == 1 && this.configuration.config.pan) {
@@ -318,9 +566,7 @@ export class Render extends RenderProvider {
             this.emit("mousedown", this._getArgs(this))
             if (this.transformer.isClickedTransformer()) return;
             const worldPosition = this.worldPosition();
-            this.selection._startPosition = worldPosition;
-            this.selection._isSelecting = true;
-            this.selection._justFinishedSelecting = false;
+            this.selection.begin(worldPosition);
             return;
         }
 
@@ -353,10 +599,8 @@ export class Render extends RenderProvider {
         this._mousePosition.y = event.clientY
         if (!this.pointerInWorld(this.mousePosition())) return;
 
-        if (this.selection._isSelecting) {
-            this.selection._endPosition = this.worldPosition();
-            this.selection._width = this.selection._endPosition.x - this.selection._startPosition.x;
-            this.selection._height = this.selection._endPosition.y - this.selection._startPosition.y;
+        if (this.selection.isSelecting) {
+            this.selection.track(this.worldPosition());
             return;
         }
 
@@ -384,6 +628,7 @@ export class Render extends RenderProvider {
             this._draggingShape.position.y += delta.y;
             this._lastMousePos = current;
             this._wasDragging = true;
+            this._sceneDirty = true;
 
             if (this.configuration.config.snap) {
                 this.snapSmart.update();
@@ -409,22 +654,18 @@ export class Render extends RenderProvider {
     private _onMouseUp(): void {
         this.emit("mouseup", this._getArgs(this))
 
-        if (this.selection._isSelecting) {
-            const distance = Math.sqrt(this.selection._width * this.selection._width + this.selection._height * this.selection._height);
-            if (distance >= this.selection._minDistance) {
-                this.selection.detectSelectedShapes();
-                this.selection._justFinishedSelecting = true;
-            }
-        }
-
-        this.selection._isSelecting = false;
-        this.selection._startPosition = Vector.zero;
-        this.selection._endPosition = Vector.zero;
-        this.selection._width = 0;
-        this.selection._height = 0;
+        this.selection.finish();
 
         if (this._isDragging && this._draggingShape) {
             this._draggingShape.emit("dragend", this._getArgs(this._draggingShape))
+            // E5: a completed drag is a user-visible update to the shape's
+            // position; broadcast it as an update patch.
+            this.emitPatch({
+                op: "update",
+                id: this._draggingShape.id,
+                type: this._draggingShape.type,
+                delta: { position: { x: this._draggingShape.position.x, y: this._draggingShape.position.y } },
+            });
             this.autoSave(true);
         }
 
@@ -505,12 +746,46 @@ export class Render extends RenderProvider {
     }
 
     /**
-     * Gets the list of all shapes ordered by their zIndex.
-     * @returns Sorted list of shapes.
+     * Gets the list of all shapes ordered by descending zIndex (top-most first).
+     *
+     * The sorted array is cached and only rebuilt when the z-order has been
+     * invalidated (a shape added/removed, or a shape's zIndex changed), so the
+     * render loop and input handlers no longer sort on every call. The returned
+     * array is the shared cache — callers MUST NOT mutate it (do not `.reverse()`
+     * or `.sort()` it in place); iterate a copy if mutation is needed.
+     *
+     * @returns Shared, cached list of shapes ordered by descending zIndex.
      * @private
      */
     private _getChildrens(): Shape[] {
-        return Array.from([...this.childrens.values()]).sort((a, b) => b.zIndex - a.zIndex)
+        if (this._zOrderDirty || this._zOrderCache === null) {
+            this._zOrderCache = Array.from(this.childrens.values()).sort((a, b) => b.zIndex - a.zIndex);
+            this._zOrderDirty = false;
+        }
+        return this._zOrderCache;
+    }
+
+    /**
+     * Marks the cached z-order (see {@link _getChildrens}) as stale so it is
+     * rebuilt on the next read. Called by the {@link RenderManager} on
+     * add/remove and by a shape whenever its `zIndex` changes.
+     * @internal
+     */
+    public invalidateZOrder(): void {
+        this._zOrderDirty = true;
+        // Adding/removing shapes or reordering them is a scene edit, so the next
+        // autosave must re-serialize.
+        this._sceneDirty = true;
+    }
+
+    /**
+     * Marks the scene as edited so the next autosave re-serializes instead of
+     * skipping as a no-op. Mutations that do not flow through add/remove/z-order
+     * (for example transformer moves/resizes) should call this.
+     * @internal
+     */
+    public markDirty(): void {
+        this._sceneDirty = true;
     }
 
     /**
@@ -555,7 +830,8 @@ export class Render extends RenderProvider {
         const textWidth = measureText.width;
         const textHeight = measureText.fontBoundingBoxAscent + measureText.fontBoundingBoxDescent;
         
-        this.ctx.translate(this.canvas.width - textWidth * 1.5 - 10, textHeight + 10);
+        // CSS units: the context is DPR-scaled, so position against the CSS size.
+        this.ctx.translate(this._cssWidth - textWidth * 1.5 - 10, textHeight + 10);
         
         this.ctx.fillStyle = "white";
         this.ctx.font = "16px Arial";
@@ -588,7 +864,7 @@ export class Render extends RenderProvider {
             if (!this.configuration.config.save) return;
 
             if (this.configuration.config.save === "indexeddb") {
-                const configurationTable = this._database?.getTable("configurations" as never);
+                const configurationTable = this._database?.getTable("configurations");
                 if (configurationTable) {
                     await this._saveConfiguration(configurationTable);
                 }
@@ -606,10 +882,23 @@ export class Render extends RenderProvider {
      */
     private async _executeSave(history: boolean): Promise<void> {
         try {
+            // Dirty-flag fast path: if nothing has changed since the last
+            // serialization, skip the whole save — no serialize, no history
+            // entry, no storage write. This removes the redundant full-scene
+            // `JSON.stringify` on no-op edits. The very first save runs because
+            // `_sceneDirty` starts true.
+            if (!this._sceneDirty && this._lastSerializedData !== "") {
+                return;
+            }
+
             const newData = await this._serializeAsync();
             const serializedString = JSON.stringify(newData);
 
             const dataHasChanged = serializedString !== this._lastSerializedData;
+
+            // A completed serialization means the scene is clean until the next
+            // edit flips the flag again.
+            this._sceneDirty = false;
 
             this._saveCounter++;
 
@@ -617,7 +906,12 @@ export class Render extends RenderProvider {
                 this.history.save(newData);
             }
 
-            if (!this.configuration.config.save) return;
+            if (!this.configuration.config.save) {
+                // Even with no storage backend, remember the serialized form so
+                // the dirty-flag fast path can short-circuit future no-op saves.
+                this._lastSerializedData = serializedString;
+                return;
+            }
 
             if (this.configuration.config.save === "localstorage") {
                 await this._saveToLocalStorage(serializedString, dataHasChanged);
@@ -625,9 +919,7 @@ export class Render extends RenderProvider {
                 await this._saveToIndexedDB(newData, dataHasChanged);
             }
 
-            if (dataHasChanged) {
-                this._lastSerializedData = serializedString;
-            }
+            this._lastSerializedData = serializedString;
 
         } catch (error) {
             console.error('Error in _executeSave:', error);
@@ -685,8 +977,8 @@ export class Render extends RenderProvider {
      */
     private async _saveToIndexedDB(newData: ShapeRawData[], dataHasChanged: boolean): Promise<void> {
         try {
-            const table = this._database?.getTable("nodes" as never);
-            const configurationTable = this._database?.getTable("configurations" as never);
+            const table = this._database?.getTable("nodes");
+            const configurationTable = this._database?.getTable("configurations");
             
             if (!configurationTable || !table) {
                 console.warn('Database tables not available');
@@ -701,7 +993,7 @@ export class Render extends RenderProvider {
             }
 
             if (dataHasChanged) {
-                await table.putMany(newData as never, true, 50, progressCallback ? (progress) => {
+                await table.putMany(newData, true, 50, progressCallback ? (progress) => {
                     progressCallback({ p: progress.p * 0.9, state: true });
                 } : undefined);
 
@@ -733,11 +1025,11 @@ export class Render extends RenderProvider {
      * Save configuration optimized
      * @private
      */
-    private async _saveConfiguration(configurationTable: any): Promise<void> {
+    private async _saveConfiguration(configurationTable: Table<ConfigurationSchema>): Promise<void> {
         try {
-            const configData = { id: "data", ...this.getProperties() };
-            
-            await configurationTable.put(configData as never);
+            const configData: ConfigurationSchema = { id: "data", ...this.getProperties() };
+
+            await configurationTable.put(configData);
         } catch (error) {
             console.error('Error saving configuration:', error);
         }
@@ -748,7 +1040,8 @@ export class Render extends RenderProvider {
      * @private
      */
     private _clear(): void {
-        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
+        // The context is scaled by the DPR (see `resize`), so clear in CSS units.
+        this.ctx.clearRect(0, 0, this._cssWidth, this._cssHeight)
     }
 
     /**
@@ -764,9 +1057,13 @@ export class Render extends RenderProvider {
 
         this.currentCamera.update()
 
-        this._getChildrens().reverse().forEach((child: Shape) => {
-            child.update()
-        })
+        // Draw back-to-front: iterate the descending-zIndex cache in reverse
+        // WITHOUT mutating it (the array is shared — a `.reverse()` here would
+        // corrupt the cache read by the input handlers).
+        const ordered = this._getChildrens();
+        for (let i = ordered.length - 1; i >= 0; i--) {
+            ordered[i]!.update()
+        }
 
         if (this.configuration.config.snap) {
             this.snapSmart.drawGuides()
@@ -819,15 +1116,33 @@ export class Render extends RenderProvider {
      * @returns List of shapes ordered by zIndex.
      */
     public get childs(): Shape[] {
-        return this._getChildrens();
+        // Return a copy so external callers cannot mutate the shared z-order cache.
+        return [...this._getChildrens()];
     }
 
     /**
      * Gets the database instance associated with this render.
      * @returns The database instance.
      */
-    public get database(): Database | null {
+    public get database(): Database<RenderDatabaseSchema> | null {
         return this._database;
+    }
+
+    /**
+     * Gets a copy of the current global canvas position used for panning.
+     * Returns a copy so external callers cannot mutate internal state.
+     * @returns A copied {@link Vector} of the global position.
+     */
+    public get globalPosition(): Vector {
+        return this._globalPosition.copy();
+    }
+
+    /**
+     * Gets the current z-index bounds across all shapes.
+     * @returns A readonly object with the `min` and `max` z-index values.
+     */
+    public get zIndexRange(): { readonly min: number; readonly max: number } {
+        return { min: this.manager.minZIndex, max: this.manager.maxZIndex };
     }
     
     /**
@@ -850,15 +1165,20 @@ export class Render extends RenderProvider {
      */
     public setProperties(props: Partial<RenderProperties>) {
         if (!props) return;
-        
-        if (props.zoom !== undefined) {
-            this._zoom = props.zoom;
+
+        // View-state is a trust boundary too (it comes from localStorage /
+        // IndexedDB). Validate so a corrupt store can never set a NaN zoom or a
+        // malformed camera position; invalid fields are dropped, not applied.
+        const safe = validateProperties(props);
+
+        if (safe.zoom !== undefined) {
+            this._zoom = safe.zoom;
         }
-        if (props.globalPosition !== undefined) {
-            this._globalPosition = props.globalPosition;
+        if (safe.globalPosition !== undefined) {
+            this._globalPosition = new Vector(safe.globalPosition.x, safe.globalPosition.y);
         }
-        if (props.offsetPan !== undefined) {
-            this._offsetPan = props.offsetPan;
+        if (safe.offsetPan !== undefined) {
+            this._offsetPan = new Vector(safe.offsetPan.x, safe.offsetPan.y);
         }
     }
 
@@ -870,11 +1190,7 @@ export class Render extends RenderProvider {
         this.transformer.hide();
         this.disallowFps();
         this.snapSmart.unbind();
-        this.selection._isSelecting = false;
-        this.selection._startPosition = Vector.zero;
-        this.selection._endPosition = Vector.zero;
-        this.selection._width = 0;
-        this.selection._height = 0;
+        this.selection.reset();
         this._render();
     }
 
@@ -900,12 +1216,91 @@ export class Render extends RenderProvider {
     }
 
     /**
-     * Adjusts the canvas size to match its visual size.
+     * Adjusts the canvas backing store to match its on-screen (CSS) size,
+     * accounting for the device pixel ratio so rendering stays crisp on HiDPI
+     * displays and matches the DPR-scaled export path.
+     *
+     * The backing store is sized to `cssSize * devicePixelRatio`, the CSS size is
+     * left untouched (the element still occupies the same box on screen), and the
+     * context is scaled by the DPR so all drawing code keeps working in CSS
+     * pixels. `pointerInWorld` therefore compares against the CSS size, not the
+     * raw backing-store size.
      */
     public resize(): void {
-        const { width, height } = this.canvas.getBoundingClientRect()
-        this.canvas.width = width
-        this.canvas.height = height
+        const rect = this._refreshCanvasRect();
+        const { width, height } = rect;
+        const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+
+        // Backing store in device pixels for sharpness.
+        this.canvas.width = Math.round(width * dpr);
+        this.canvas.height = Math.round(height * dpr);
+
+        // Map CSS pixels -> device pixels so all drawing stays in CSS units.
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    /**
+     * Returns the cached canvas bounding rect, computing it once if the cache is
+     * empty. Callers in the hot path (hit tests, coordinate conversions) use this
+     * instead of calling `getBoundingClientRect()` directly, which forces a
+     * synchronous layout.
+     * @returns The cached {@link DOMRect} for the canvas.
+     * @private
+     */
+    private _getCanvasRect(): DOMRect {
+        if (this._canvasRect === null) {
+            this._canvasRect = this.canvas.getBoundingClientRect();
+        }
+        return this._canvasRect;
+    }
+
+    /**
+     * Recomputes and stores the canvas bounding rect. Called on
+     * resize/scroll/orientationchange and at drag start — the moments the
+     * canvas's on-screen box can actually move.
+     * @returns The freshly measured {@link DOMRect}.
+     * @private
+     */
+    private _refreshCanvasRect(): DOMRect {
+        this._canvasRect = this.canvas.getBoundingClientRect();
+        return this._canvasRect;
+    }
+
+    /**
+     * The on-screen (CSS) width of the canvas, independent of the DPR-scaled
+     * backing store. All drawing/interaction math works in CSS pixels because
+     * the context is scaled by the DPR in {@link resize}; use this instead of
+     * `canvas.width` (which now holds device pixels).
+     */
+    public get cssWidth(): number {
+        return this._getCanvasRect().width;
+    }
+
+    /**
+     * The on-screen (CSS) height of the canvas, independent of the DPR-scaled
+     * backing store. See {@link cssWidth}.
+     */
+    public get cssHeight(): number {
+        return this._getCanvasRect().height;
+    }
+
+    /** Internal alias kept for the hot-path call sites. @private */
+    private get _cssWidth(): number {
+        return this.cssWidth;
+    }
+
+    /** Internal alias kept for the hot-path call sites. @private */
+    private get _cssHeight(): number {
+        return this.cssHeight;
+    }
+
+    /**
+     * The device pixel ratio the backing store was scaled by in {@link resize}.
+     * Export reads the backing store (device pixels), so it multiplies CSS crop
+     * coordinates by this to address the correct source region.
+     */
+    public get devicePixelRatio(): number {
+        return (typeof window !== "undefined" && window.devicePixelRatio) || 1;
     }
 
     /**
@@ -921,7 +1316,7 @@ export class Render extends RenderProvider {
      * @returns Vector with the relative mouse position.
      */
     public relativePosition(): Vector {
-        const { left, top } = this.canvas.getBoundingClientRect()
+        const { left, top } = this._getCanvasRect()
         return this.mousePosition().sub(new Vector(left, top));
     }
 
@@ -939,7 +1334,7 @@ export class Render extends RenderProvider {
      * @returns Vector with world coordinates.
      */
     public toWorldCoordinates(vector: Vector): Vector {
-        const rect = this.canvas.getBoundingClientRect()
+        const rect = this._getCanvasRect()
         const x = vector.x - rect.left
         const y = vector.y - rect.top
         return new Vector((x - this._globalPosition.x) / this._zoom, (y - this._globalPosition.y) / this._zoom)
@@ -960,7 +1355,7 @@ export class Render extends RenderProvider {
      * @returns Vector with absolute coordinates.
      */
     public toAbsoluteCoordinates(vector: Vector): Vector {
-        const rect = this.canvas.getBoundingClientRect()
+        const rect = this._getCanvasRect()
         const x = vector.x * this._zoom + this._globalPosition.x
         const y = vector.y * this._zoom + this._globalPosition.y
         return new Vector(x + rect.left, y + rect.top)
@@ -972,7 +1367,7 @@ export class Render extends RenderProvider {
      * @returns Vector with relative coordinates.
      */
     public toRelativeCoordinates(vector: Vector): Vector {
-        const rect = this.canvas.getBoundingClientRect()
+        const rect = this._getCanvasRect()
         const x = vector.x
         const y = vector.y
         return new Vector(x - rect.left, y - rect.top)
@@ -984,10 +1379,13 @@ export class Render extends RenderProvider {
      * @returns true if the point is inside the canvas, false otherwise.
      */
     public pointerInWorld(pointer: Vector): boolean {
-        const { left, top } = this.canvas.getBoundingClientRect()
+        const { left, top } = this._getCanvasRect()
         const x = pointer.x - left
         const y = pointer.y - top
-        return x >= 0 && x <= this.canvas.width && y >= 0 && y <= this.canvas.height
+        // Compare against the on-screen (CSS) size. The backing store is now
+        // DPR-scaled (see `resize`), so `canvas.width/height` are device pixels
+        // and would over-report the hit region on HiDPI displays.
+        return x >= 0 && x <= this._cssWidth && y >= 0 && y <= this._cssHeight
     }
 
     /**
@@ -1122,13 +1520,13 @@ export class Render extends RenderProvider {
                     this.onLoadProgress({ p: 0.2, state: true });
                 }
 
-                const data0 = await this._database.get("nodes" as never)?.getAll();
+                const data0 = await this._database.get("nodes")?.getAll();
                 
                 if (this.onLoadProgress) {
                     this.onLoadProgress({ p: 0.5, state: true });
                 }
 
-                const data1 = await this._database.get("configurations" as never)?.getAll();
+                const data1 = await this._database.get("configurations")?.getAll();
                 
                 if (this.onLoadProgress) {
                     this.onLoadProgress({ p: 0.7, state: true });
@@ -1138,8 +1536,8 @@ export class Render extends RenderProvider {
                     data = data0;
                 }
 
-                if (data1) {
-                    this.setProperties(data1[0] as never);
+                if (data1 && data1[0]) {
+                    this.setProperties(data1[0]);
                 }
             }
     
@@ -1183,11 +1581,22 @@ export class Render extends RenderProvider {
 
     /**
      * Recreates shapes from serialized data.
-     * @param data - Serialized shape data.
+     *
+     * Input is validated at this trust boundary (localStorage / IndexedDB /
+     * explicit `load(defaultData)`): malformed shapes are repaired when a safe
+     * default exists and dropped (with a warning) otherwise, so a corrupt store
+     * can never produce `NaN` geometry or brick the editor.
+     *
+     * @param data - Serialized shape data (untrusted).
      */
     public deserialize(data: ShapeRawData[]): void {
         this.childrens.clear();
-        data.forEach((child: ShapeRawData) => {
+        this.invalidateZOrder();
+        this._sceneDirty = true;
+        const validated = validateShapes(data, {
+            allowRemoteImages: this.configuration.config.allowRemoteImages ?? false,
+        });
+        validated.forEach((child: ShapeRawData) => {
             if (child.type === "rect") {
                 Rect._fromRawData(child as RectRawData, this);
             } else if (child.type === "circle") {
@@ -1196,8 +1605,109 @@ export class Render extends RenderProvider {
                 Text._fromRawData(child as TextRawData, this);
             } else if (child.type === "image") {
                 Image._fromRawData(child as ImageRawData, this);
+            } else if (child.type === "line") {
+                Line._fromRawData(child as LineRawData, this);
+            } else if (child.type === "arrow") {
+                Arrow._fromRawData(child as ArrowRawData, this);
+            } else if (child.type === "polygon") {
+                Polygon._fromRawData(child as PolygonRawData, this);
+            } else if (child.type === "path") {
+                Path._fromRawData(child as PathRawData, this);
+            } else if (child.type === "pen") {
+                Pen._fromRawData(child as PenRawData, this);
             }
+            // Unknown types never reach here: validateShapes drops them with a
+            // warn (forward-compat — a future schema's type is skipped, not thrown).
         });
+    }
+
+    /**
+     * The serialized document schema version this build writes. Bumped to `2`
+     * for the E2 shape additions (line/arrow/polygon/path/pen). A loader treats
+     * an absent version as `1`; unknown shape `type`s are skipped with a warn
+     * rather than throwing, so newer documents degrade gracefully in older code.
+     */
+    public static readonly schemaVersion: number = 2;
+
+    /**
+     * @internal
+     * Emits a granular `patch` event (E5) describing a single scene mutation,
+     * unless a remote patch is currently being applied (in which case the change
+     * is suppressed to avoid a sync feedback loop). Call from add/update/remove
+     * sites that want to participate in the change-stream.
+     *
+     * @param patch - The change to broadcast.
+     */
+    public emitPatch(patch: Patch): void {
+        if (this._applyingRemote) return;
+        this.emit("patch", patch);
+    }
+
+    /**
+     * Applies a remote {@link Patch} to the local scene without re-emitting a
+     * `patch` event (loop-safe), so two peers exchanging patches do not ping-pong
+     * forever. Supports `add`, `update`, and `remove` operations.
+     *
+     * - `add`: instantiates a shape from `delta` (which must carry enough raw
+     *   data, including `type`). Untrusted deltas are validated the same way as
+     *   `deserialize`.
+     * - `update`: shallow-applies `delta` fields to the existing shape's raw data
+     *   and rebuilds it in place (id preserved).
+     * - `remove`: destroys the shape with the given id if present.
+     *
+     * @param patch - The remote change to apply.
+     */
+    public applyPatch(patch: Patch): void {
+        this._applyingRemote = true;
+        try {
+            if (patch.op === "remove") {
+                const existing = this.childrens.get(patch.id);
+                if (existing) existing.destroy();
+                return;
+            }
+
+            if (patch.op === "add") {
+                if (!patch.delta) return;
+                const raw = { ...patch.delta, id: patch.id, type: patch.type } as ShapeRawData;
+                this._instantiateFromRaw(raw);
+                return;
+            }
+
+            // update: merge delta onto the current raw data, then rebuild in place.
+            const existing = this.childrens.get(patch.id);
+            if (!existing) return;
+            const merged = { ...existing._rawData(), ...(patch.delta ?? {}), id: patch.id } as ShapeRawData;
+            existing.destroy();
+            this._instantiateFromRaw(merged);
+        } finally {
+            this._applyingRemote = false;
+            this.markDirty();
+        }
+    }
+
+    /**
+     * @internal
+     * Validates a single raw shape (same trust-boundary policy as
+     * {@link deserialize}) and instantiates it, dispatching on `type`. Used by
+     * {@link applyPatch}.
+     */
+    private _instantiateFromRaw(raw: ShapeRawData): Shape | null {
+        const [validated] = validateShapes([raw], {
+            allowRemoteImages: this.configuration.config.allowRemoteImages ?? false,
+        });
+        if (!validated) return null;
+        switch (validated.type) {
+            case "rect": return Rect._fromRawData(validated as RectRawData, this);
+            case "circle": return Circle._fromRawData(validated as CircleRawData, this);
+            case "text": return Text._fromRawData(validated as TextRawData, this);
+            case "image": return Image._fromRawData(validated as ImageRawData, this);
+            case "line": return Line._fromRawData(validated as LineRawData, this);
+            case "arrow": return Arrow._fromRawData(validated as ArrowRawData, this);
+            case "polygon": return Polygon._fromRawData(validated as PolygonRawData, this);
+            case "path": return Path._fromRawData(validated as PathRawData, this);
+            case "pen": return Pen._fromRawData(validated as PenRawData, this);
+            default: return null;
+        }
     }
 
     /**
@@ -1208,17 +1718,17 @@ export class Render extends RenderProvider {
         this.configuration.load(config)
         
         if (this.configuration.config.save === "indexeddb") {
-            this._database = new Database('myDatabase', 1);
+            const database = new Database<{}>('myDatabase', 1)
+                .createTable<"nodes", NodeSchema>({
+                    name: "nodes",
+                    primary: "id",
+                })
+                .createTable<"configurations", ConfigurationSchema>({
+                    name: "configurations",
+                    primary: "id",
+                });
 
-            this._database.createTable<"nodes", NodeSchema>({
-                name: "nodes",
-                primary: "id",
-            })
-
-            this._database.createTable<"configurations", ConfigurationSchema>({
-                name: "configurations",
-                primary: "id",
-            })
+            this._database = database;
 
             await this._database.init();
         }
@@ -1261,7 +1771,7 @@ export class Render extends RenderProvider {
      * Starts the rendering loop.
      */
     public start(): void {
-        if (this._frameId) return
+        if (this._frameId !== null) return
         this._frameId = requestAnimationFrame(this._renderBound)
     }
 
@@ -1269,34 +1779,60 @@ export class Render extends RenderProvider {
      * Stops the rendering loop.
      */
     public stop(): void {
-        if (!this._frameId) return
+        if (this._frameId === null) return
         cancelAnimationFrame(this._frameId)
         this._frameId = null
     }
 
     /**
-     * Cleans up all resources and removes event listeners.
-     * Should be called before removing the renderer instance.
+     * Tears down the renderer: cancels the animation frame, clears pending
+     * timeouts, removes every DOM listener from the exact target it was added
+     * to, destroys every sub-component, and closes the database (terminating its
+     * worker). This is the real teardown; prefer `await render.destroy()`.
+     *
+     * @returns A promise that resolves once the database has been closed.
      */
-    public cleanup(): void {
+    public async destroy(): Promise<void> {
         if (this._frameId !== null) {
             cancelAnimationFrame(this._frameId);
             this._frameId = null;
         }
 
-        if (this._configSaveTimeout) {
+        if (this._configSaveTimeout !== null) {
             clearTimeout(this._configSaveTimeout);
             this._configSaveTimeout = null;
         }
 
-        this.canvas.removeEventListener("contextmenu", this._onContextmenuBound);
-        this.canvas.removeEventListener("click", this._onMouseClickedBound);
-        this.canvas.removeEventListener("mousedown", this._onMouseDownBound);
-        this.canvas.removeEventListener("mousemove", this._onMouseMovedBound);
-        this.canvas.removeEventListener("mouseup", this._onMouseUpBound);
-        this.canvas.removeEventListener("wheel", this._onMouseWheelBound);
-        document.removeEventListener("keydown", this._onKeyDownBound);
-        document.removeEventListener("keyup", this._onKeyUpBound);
-        window.removeEventListener("resize", this._resizeBound);
+        if (this._wheelTimeout !== null) {
+            clearTimeout(this._wheelTimeout);
+            this._wheelTimeout = null;
+        }
+
+        this._removeListeners();
+
+        this._activePointers.clear();
+        this._lastPinchDistance = null;
+        this._lastTouchCenter = null;
+
+        this.transformer.destroy();
+        this.exporter.destroy();
+        this.configuration.destroy();
+
+        if (this._database) {
+            await this._database.close();
+            this._database = null;
+        }
+    }
+
+    /**
+     * Cleans up all resources and removes event listeners.
+     * Should be called before removing the renderer instance.
+     *
+     * @deprecated Synchronous alias for {@link destroy}. It kicks off teardown
+     * (including the asynchronous database close) without awaiting it; call
+     * `await render.destroy()` when you need to know teardown has finished.
+     */
+    public cleanup(): void {
+        void this.destroy();
     }
 }

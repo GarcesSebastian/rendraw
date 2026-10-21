@@ -1,6 +1,7 @@
 import { IShape, Shape, ShapeRawData } from "../Shape";
 import { Render } from "../../Render";
 import { Vector } from "../common/Vector";
+import { svgEscape, svgNum, svgTransform } from "../utils/svg";
 
 export type RectRawData = ShapeRawData & {
     width: number;
@@ -246,7 +247,7 @@ export class Rect extends Shape {
         return {
             id: this.id,
             type: "rect",
-            position: this.position,
+            position: { x: this.position.x, y: this.position.y },
             rotation: this.rotation,
             zIndex: this.zIndex,
             dragging: this.dragging,
@@ -262,12 +263,27 @@ export class Rect extends Shape {
 
     /**
      * @internal
+     * Returns an SVG `<rect>` fragment for this rectangle in world coordinates.
+     * @returns SVG markup for the rectangle.
+     */
+    public override _toSVG(): string {
+        if (!this.visible) return "";
+        const stroke = this.borderWidth > 0
+            ? ` stroke="${svgEscape(this.borderColor)}" stroke-width="${svgNum(this.borderWidth)}"`
+            : "";
+        const rx = this.borderRadius > 0 ? ` rx="${svgNum(this.borderRadius)}"` : "";
+        return `<g transform="${svgTransform(this.position.x, this.position.y, this.rotation)}">` +
+            `<rect x="0" y="0" width="${svgNum(this.width)}" height="${svgNum(this.height)}"${rx} fill="${svgEscape(this.color)}"${stroke} /></g>`;
+    }
+
+    /**
+     * @internal
      * Creates a new rectangle instance from raw data.
      * @param data - The raw data of the rectangle.
      * @returns A new `Rect` instance with identical properties.
      */
     public static _fromRawData(data: RectRawData, render: Render) : Rect {
-        const rect = new Rect(data, render, data.id);
+        const rect = new Rect({ ...data, position: new Vector(data.position.x, data.position.y) }, render, data.id);
         rect.position = new Vector(data.position.x, data.position.y);
         rect.rotation = data.rotation;
         rect.zIndex = data.zIndex;
@@ -278,6 +294,7 @@ export class Rect extends Shape {
         rect.color = data.color;
         rect.borderWidth = data.borderWidth;
         rect.borderColor = data.borderColor;
+        rect.borderRadius = data.borderRadius;
 
         render.emit("create", { shape: rect });
         

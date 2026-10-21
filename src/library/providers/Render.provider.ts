@@ -1,5 +1,5 @@
 import { Vector } from "../instances/common/Vector";
-import { Shape, ShapeRawData } from "../instances/Shape";
+import { Shape, ShapeRawData, ShapeType } from "../instances/Shape";
 import { Render } from "../Render";
 
 export type RenderEventTemplate = {
@@ -20,12 +20,58 @@ export type RenderEventCreate = { shape: Shape };
 export type RenderEventSave = { data: ShapeRawData[] };
 export type RenderEventLoad = { data: ShapeRawData[] };
 
+/** Kind of input device that produced a pointer event. */
+export type PointerKind = "mouse" | "touch" | "pen";
+
+/**
+ * Payload for the additive `pointerdown`/`pointermove`/`pointerup` events (E1).
+ * Mirrors the mouse-event template but additionally carries the originating
+ * device kind so touch/pen consumers can branch on it.
+ */
+export type RenderEventPointer = RenderEventTemplate & {
+    /** Device that produced the event: mouse, touch, or pen. */
+    pointerType: PointerKind;
+    /** Native pointer id, useful for tracking multi-touch sequences. */
+    pointerId: number;
+};
+
+/**
+ * Payload for the additive `pinch` event (E1), emitted while two pointers are
+ * active and their distance changes.
+ */
+export type RenderEventPinch = {
+    /** Multiplicative scale delta since the previous pinch sample (>1 = zoom in). */
+    scale: number;
+    /** Midpoint between the two active pointers, in absolute screen coordinates. */
+    center: Vector;
+};
+
+/**
+ * Payload for the additive `patch` event (E5): a single granular change to the
+ * scene suitable for CRDT / websocket synchronisation.
+ */
+export type Patch = {
+    /** The kind of mutation this patch describes. */
+    op: "add" | "update" | "remove";
+    /** The affected shape's id. */
+    id: string;
+    /** The affected shape's type. */
+    type: ShapeType;
+    /** For `add`/`update`, the (partial) raw data describing the change. */
+    delta?: Partial<ShapeRawData>;
+};
+
 export type RenderEventMap = {
     "click": RenderEventClick;
     "dblclick": RenderEventClick;
     "mousemove": RenderEventMouseMove;
     "mousedown": RenderEventMouseDown;
     "mouseup": RenderEventMouseUp;
+    "pointerdown": RenderEventPointer;
+    "pointermove": RenderEventPointer;
+    "pointerup": RenderEventPointer;
+    "pinch": RenderEventPinch;
+    "patch": Patch;
     "create": RenderEventCreate;
     "undo": RenderEventBlank;
     "redo": RenderEventBlank;
@@ -59,6 +105,11 @@ export class RenderProvider {
         "mousemove": [],
         "mousedown": [],
         "mouseup": [],
+        "pointerdown": [],
+        "pointermove": [],
+        "pointerup": [],
+        "pinch": [],
+        "patch": [],
         "create": [],
         "undo": [],
         "redo": [],
@@ -86,6 +137,11 @@ export class RenderProvider {
     public on(event: "mousemove", callback: ListenerCallback<"mousemove">): void;
     public on(event: "mousedown", callback: ListenerCallback<"mousedown">): void;
     public on(event: "mouseup", callback: ListenerCallback<"mouseup">): void;
+    public on(event: "pointerdown", callback: ListenerCallback<"pointerdown">): void;
+    public on(event: "pointermove", callback: ListenerCallback<"pointermove">): void;
+    public on(event: "pointerup", callback: ListenerCallback<"pointerup">): void;
+    public on(event: "pinch", callback: ListenerCallback<"pinch">): void;
+    public on(event: "patch", callback: ListenerCallback<"patch">): void;
     public on(event: "create", callback: ListenerCallback<"create">): void;
     public on(event: "undo", callback: ListenerCallback<"undo">): void;
     public on(event: "redo", callback: ListenerCallback<"redo">): void;
